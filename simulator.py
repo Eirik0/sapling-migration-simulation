@@ -1,6 +1,7 @@
 #!/usr/bin/env python2
 
 import random
+from collections import deque
 
 
 SAPLING_ACTIVATION_HEIGHT = 400
@@ -16,22 +17,66 @@ SAPLING_PREFIX = "z"
 TRANSPARENT_PREFIX = "t"
 
 
-class Transaction:
-    def __init__(self, block_height, input, output, amount):
+class Transaction(object):
+    def __init__(self, block_height, sprout_inputs, sprout_change, sapling_outputs):
         self.block_height = block_height
         # tx_id = (PREFIX + "_" + user_id + "_" + tx_num) or ("cb_" + cb_index)
-        self.input = input
-        self.output = output
-        self.amount = amount
+        self.sprout_inputs = sprout_inputs
+        self.sprout_change = sprout_change
+        self.sapling_outputs = sapling_outputs
+        assert(sum(inputs) == sum(outputs))
 
 
-class User:
+class UserMigrationStrategy(object):
+    def __init__(self, user):
+        self.user = user
+
+    def on_block_height(self, height):
+        return []
+
+
+class UniformRandomDistributionStrategy(UserMigrationStrategy):
+    def __init__(self, user, lowerbound, upperbound):
+        UserMigrationStrategy.__init__(self, user)
+        self.lowerbound = lowerbound
+        self.upperbound = upperbound
+
+    def on_block_height(self, height):
+        amount = min(self.sprout_balance(), random.randint(self.lowerbound, self.upperbound))
+        (inputs, change) = note_selection(user.sprout_amounts(), amount)
+        tx = Transaction(block_height, inputs, change, [amount])
+        return [tx]
+
+
+def note_selection(sprout_amounts, total):
+    assert total > 0
+    # TODO: sort amounts?
+    amount_so_far = 0
+    n = 0
+    for amount in sprout_amounts:
+        amount_so_far += amount
+        n += 1
+        if amount_so_far >= total:
+            break
+
+    assert amount_so_far >= total
+    change = total - amount_so_far
+    return (sprout_amounts[:n], change)
+
+
+
+class User(object):
     def __init__(self, user_id):
         self.user_id = user_id
         self.sprout_amounts = []
         self.sapling_amounts = []
         self.transparent_amounts = []
-        self.num_txs = 0
+
+    def sprout_balance(self):
+        return sum(self.sprout_amounts)
+
+    def sapling_balance(self):
+        return sum(self.sapling_amounts)
 
     def add_amount(self, is_shielded, amount, is_sapling):
         if is_shielded:
@@ -51,9 +96,9 @@ def distribute_coinbase_transactions(block_height, users, transactions, is_sapli
     coinbase_amount = ZEC_PER_BLOCK
     cb_index = 0
     while coinbase_amount > 0:
-        # Distriburte random amount to random user
+        # Distribute random amount to random user
         if coinbase_amount > 0.5:
-            distibution_amount = random.uniform(0, coinbase_amount)
+            distibution_amount = random.randint(0, coinbase_amount)
         else:
             distibution_amount = coinbase_amount
 
