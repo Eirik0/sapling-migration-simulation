@@ -24,23 +24,25 @@ class TxType(Enum):
 
 
 class TxInput(object):
-    def __init__(self, tx_type, prev_txid, index):
+    def __init__(self, tx_type, prev_txid, prev_index):
         self.tx_type = tx_type
         self.prev_txid = prev_txid
-        self.index = index
+        self.prev_index = prev_index
 
     def __str__(self):
-        return "{{\"tx_type\": \'{}\', \"prev_tx\": {}, \"index\": {}}}".format(self.tx_type.value, self.prev_txid, self.index)
+        return "{{\"tx_type\":\'{}\',\"prev_tx\":{},\"prev_index\":{}}}".format(self.tx_type.value, self.prev_txid, self.prev_index)
 
 
 class TxOutput(object):
-    def __init__(self, tx_type, amount):
+    def __init__(self, tx_type, index, amount):
+        assert(amount > 0)
         self.tx_type = tx_type
+        self.index = index
         self.amount = amount
         self.spent = False
 
     def __str__(self):
-        return "{{\"tx_type\": \'{}\', \"amount\": {}, \"spent\": {}}}".format(self.tx_type.value, self.amount, self.spent)
+        return "{{\"tx_type\":\'{}\',\"index\":{},\"amount\":{},\"spent\":{}}}".format(self.tx_type.value, self.index, self.amount, self.spent)
 
 
 class Transaction(object):
@@ -74,12 +76,9 @@ class Transaction(object):
             assert(total_in == total_out)
 
     def get_prevout(self, input):
-        index = 0
         for output in self.outputs:
-            if output.tx_type == input.tx_type:
-                if index == input.index:
-                    return output
-                index += 1
+            if output.tx_type == input.tx_type and output.index == input.prev_index:
+                return output
 
         raise Exception('Prevout not found')
 
@@ -93,57 +92,60 @@ class Transaction(object):
 class User(object):
     def __init__(self, user_id):
         self.user_id = user_id
-        self.outputs = []
+        self.outputs = []  # This is a pair of (Transaction.txid, TxOutput)
 
     def get_balance(self, tx_type):
         balance = 0
-        for output in self.outputs:
+        for txid, output in self.outputs:
             if output.tx_type == tx_type and not output.spent:
                 balance += output.amount
         return balance
 
-    def add_output(self, output):
-        self.outputs.append(output)
+    def add_output(self, txid, output):
+        self.outputs.append((txid, output))
 
 
 class UserMigrationStrategy(object):
-    def __init__(self, user):
-        self.user = user
-
-    def on_block_height(self, height):
+    def migrate_funds(self, user, block_height):
         return []
 
 
 class UniformRandomDistributionStrategy(UserMigrationStrategy):
-    def __init__(self, user, lowerbound, upperbound):
-        UserMigrationStrategy.__init__(self, user)
+    def __init__(self, lowerbound, upperbound):
         self.lowerbound = lowerbound
         self.upperbound = upperbound
 
-    def on_block_height(self, block_height):
-        amount = min(self.sprout_balance(), random.randint(self.lowerbound, self.upperbound))
-        (inputs, change) = UniformRandomDistributionStrategy.note_selection(self.user.sprout_amounts(), amount)
-        tx = Transaction(block_height, inputs, change, [amount])
-        return [tx]
-
-    def note_selection(sprout_amounts, total):
-        assert total > 0
+    def migrate_funds(self, user, block_height):
+        target_amount = random.randint(self.lowerbound, self.upperbound)
+        actual_amount = 0
+        inputs = []
         # TODO: sort amounts?
-        amount_so_far = 0
-        n = 0
-        for amount in sprout_amounts:
-            amount_so_far += amount
-            n += 1
-            if amount_so_far >= total:
-                break
+        for txid, output in user.outputs:
+            if not output.spent and output.tx_type == TxType.sprout:
+                inputs.append(TxInput(output.tx_type, txid, output.index))
+                actual_amount += output.amount
+                if actual_amount >= target_amount:
+                    break
 
-        assert amount_so_far >= total
-        change = total - amount_so_far
-        return (sprout_amounts[:n], change)
+        if len(inputs) == 0:
+            return []
+
+        out_amount = min(target_amount, actual_amount)
+        outputs = [TxOutput(TxType.sapling, 0, out_amount)]
+        if actual_amount > target_amount:
+            outputs.append(TxOutput(TxType.sprout, 1, actual_amount - target_amount))
+
+        tx = Transaction(inputs, outputs)
+
+        for output in outputs:
+            user.add_output(tx.txid, output)
+
+        return [tx]
 
 
 def distribute_coinbase_transactions(users, is_sapling):
     outputs = []
+    out_index = 0
     coinbase_amount = ZATOSHIS_PER_BLOCK
     while coinbase_amount > 0:
         # Distribute random amount to random user
@@ -155,15 +157,18 @@ def distribute_coinbase_transactions(users, is_sapling):
         is_shielded = random.uniform(0, 1) <= SHIELDED_PROBABILITY
         tx_type = (TxType.sapling if is_sapling else TxType.sprout) if is_shielded else TxType.transparent
 
-        output = TxOutput(tx_type, distibution_amount)
-        outputs.append(output)
-
-        user = users[random.randint(0, NUM_USERS - 1)]
-        user.add_output(output)
+        outputs.append(TxOutput(tx_type, out_index, distibution_amount))
 
         coinbase_amount -= distibution_amount
+        out_index += 1
 
-    return Transaction([], outputs)
+    tx = Transaction([], outputs)
+
+    for output in outputs:
+        user = users[random.randint(0, NUM_USERS - 1)]
+        user.add_output(tx.txid, output)
+
+    return tx
 
 
 def write_user_balance_file(users, is_sapling):
@@ -177,13 +182,34 @@ def write_user_balance_file(users, is_sapling):
     user_balance_file = open(user_balance_file_name, "w+")
     user_balance_file.write("user_id,sprout_balance,sapling_balance,transparent_balance\n")
 
+    total_sprout = 0
+    total_sapling = 0
+    total_transparent = 0
+
     for user in sorted_users:
+        sprout = user.get_balance(TxType.sprout)
+        sapling = user.get_balance(TxType.sapling)
+        transparent = user.get_balance(TxType.transparent)
+
         user_balance_file.write("{},{},{},{}\n".format(
             user.user_id,
-            Decimal(user.get_balance(TxType.sprout)) / ZATOSHIS_PER_ZEC,
-            Decimal(user.get_balance(TxType.sapling)) / ZATOSHIS_PER_ZEC,
-            Decimal(user.get_balance(TxType.transparent)) / ZATOSHIS_PER_ZEC
+            Decimal(sprout) / ZATOSHIS_PER_ZEC,
+            Decimal(sapling) / ZATOSHIS_PER_ZEC,
+            Decimal(transparent) / ZATOSHIS_PER_ZEC
         ))
+
+        total_sprout += sprout
+        total_sapling += sapling
+        total_transparent += transparent
+
+    user_balance_file.write("{},{},{},{}\n".format(
+        "total",
+        Decimal(total_sprout) / ZATOSHIS_PER_ZEC,
+        Decimal(total_sapling) / ZATOSHIS_PER_ZEC,
+        Decimal(total_transparent) / ZATOSHIS_PER_ZEC
+    ))
+
+    user_balance_file.write("grand_total:{}\n".format(Decimal(total_sprout+total_sapling+total_transparent) / ZATOSHIS_PER_ZEC))
 
     user_balance_file.flush()
     user_balance_file.close()
@@ -198,17 +224,21 @@ def main():
     block_chain = []
 
     # Generate Sprout block data
-    for block_height in xrange(1, SAPLING_ACTIVATION_HEIGHT):
+    for block_height in xrange(0, SAPLING_ACTIVATION_HEIGHT):
         cb_tx = distribute_coinbase_transactions(users, False)
         block_chain.append([cb_tx])
 
     write_user_balance_file(users, False)
 
+    strategy = UniformRandomDistributionStrategy(ZATOSHIS_PER_ZEC, 10 * ZATOSHIS_PER_ZEC)  # Try to migrate 1 - 10 zec
+
     # Generate Sapling block data
     for block_height in xrange(SAPLING_ACTIVATION_HEIGHT, SIMULATION_END_HEIGHT):
         cb_tx = distribute_coinbase_transactions(users, True)
         block_txs = [cb_tx]
-        # TODO: Execute strategies here
+        for user in users:
+            for tx in strategy.migrate_funds(user, block_chain):
+                block_txs.append(tx)
         block_chain.append(block_txs)
 
     write_user_balance_file(users, True)
@@ -221,8 +251,8 @@ def main():
             blockchain_file.write("{},{},{},{}\n".format(
                 block_height,
                 tx.txid,
-                "[{}]".format(', '.join(str(i) for i in tx.inputs)),
-                "[{}]".format(', '.join(str(o) for o in tx.outputs))
+                "[{}]".format(','.join(str(i) for i in tx.inputs)),
+                "[{}]".format(','.join(str(o) for o in tx.outputs))
             ))
 
     blockchain_file.flush()
