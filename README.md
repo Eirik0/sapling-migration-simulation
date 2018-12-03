@@ -16,15 +16,12 @@ As part of execution we write 3 files:
 
 *blockchain.csv:*
 
->This csv file has four columns: "block_height", "input", "output", and
-"amount".
+>This csv file has four columns: "block_height", "txid", "inputs", "outputs".
 
 >This file is a simplification of the information stored on the block chain.
-"input" and "output" represent transaction ids and are formatted in a way
-such that we can figure out the type of transaction, and which user the
-amounts belongs to. In the actual Zcash block chain, some of this
-information is obfuscated, but for the sake of the validating the migration
-strategy in this simulation, it is designed to not hide any information.
+"inputs" and "outputs" can be either transparent, sprout, or sapling. This
+differs from the actual Zcash blockchain where each of these types are stored
+separately.
 
 *user\_balance\_\*.csv:*
 
